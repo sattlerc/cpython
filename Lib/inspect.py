@@ -2899,132 +2899,79 @@ class Signature:
 
     def _bind(self, args, kwargs, *, partial=False):
         """Private method. Don't use directly."""
-
+        args = iter(args)
         arguments = {}
 
-        parameters = iter(self.parameters.values())
-        parameters_ex = ()
-        arg_vals = iter(args)
+        # We iterate through all parameters, in order,
+        # consuming positional and keyword arguments as we go along.
+        for param in self.parameters.values():
+            if param.kind is _VAR_POSITIONAL:
+                # Process `*args`-like parameter.
+                # This eats up all remaining positional arguments.
+                arguments[param.name] = tuple(args)
+            elif param.kind is _VAR_KEYWORD:
+                # Process `**kwargs`-like parameter.
+                # This eats up all remaining keyword arguments.
+                arguments[param.name] = kwargs
+                kwargs = {}
+            else:
+                # At this point, the remaining cases for `param` are:
+                # * positional-only,
+                # * positional or keyword,
+                # * keyword-only.
+                # The below generator yields all matching arguments.
+                def matching_args():
+                    if param.kind is not _KEYWORD_ONLY:
+                        # Parameter can be positional.
+                        # So consume a positional argument, if available.
+                        try:
+                            yield next(args)
+                        except StopIteration:
+                            pass
 
-        while True:
-            # Let's iterate through the positional arguments and corresponding
-            # parameters
-            try:
-                arg_val = next(arg_vals)
-            except StopIteration:
-                # No more positional arguments
-                try:
-                    param = next(parameters)
-                except StopIteration:
-                    # No more parameters. That's it. Just need to check that
-                    # we have no `kwargs` after this while loop
-                    break
-                else:
-                    if param.kind == _VAR_POSITIONAL:
-                        # That's OK, just empty *args.  Let's start parsing
-                        # kwargs
-                        break
-                    elif param.name in kwargs:
-                        if param.kind == _POSITIONAL_ONLY:
-                            msg = '{arg!r} parameter is positional only, ' \
-                                  'but was passed as a keyword'
-                            msg = msg.format(arg=param.name)
-                            raise TypeError(msg) from None
-                        parameters_ex = (param,)
-                        break
-                    elif (param.kind == _VAR_KEYWORD or
-                                                param.default is not _empty):
-                        # That's fine too - we have a default value for this
-                        # parameter.  So, lets start parsing `kwargs`, starting
-                        # with the current parameter
-                        parameters_ex = (param,)
-                        break
+                    # Consume a keyword argument of given name, if available.
+                    # Even if `param` is positional-only, we still need to
+                    # check that there is no such keyword argument.
+                    try:
+                        arg = kwargs.pop(param.name)
+                    except KeyError:
+                        pass
                     else:
-                        # No default, not VAR_KEYWORD, not VAR_POSITIONAL,
-                        # not in `kwargs`
-                        if partial:
-                            parameters_ex = (param,)
-                            break
-                        else:
-                            msg = 'missing a required argument: {arg!r}'
-                            msg = msg.format(arg=param.name)
-                            raise TypeError(msg) from None
-            else:
-                # We have a positional argument to process
+                        if param.kind is _POSITIONAL_ONLY:
+                            raise TypeError(
+                                f'{param.name!r} parameter is positional '
+                                'only, but was passed as a keyword')
+                        # Parameter can be keyword.
+                        # So yield argument.
+                        yield arg
+
+                # Take argument from `matching_args`,
+                # making sure that it is unique.
+                matching_args = iter(matching_args())
                 try:
-                    param = next(parameters)
+                    arg = next(matching_args)
                 except StopIteration:
-                    raise TypeError('too many positional arguments') from None
+                    # Having no argument is only okay if
+                    # we have a default value or `partial` is set.
+                    if not (param.default is not _empty or partial):
+                        msg = f'missing a required argument: {param.name!r}'
+                        raise TypeError(msg) from None
                 else:
-                    if param.kind in (_VAR_KEYWORD, _KEYWORD_ONLY):
-                        # Looks like we have no parameter for this positional
-                        # argument
-                        raise TypeError(
-                            'too many positional arguments') from None
+                    # We have an argument.
+                    # Make sure there is no other one, then bind it.
+                    try:
+                        next(matching_args)
+                    except StopIteration:
+                        arguments[param.name] = arg
+                    else:
+                        msg = f'multiple values for argument {param.name!r}'
+                        raise TypeError(msg)
 
-                    if param.kind == _VAR_POSITIONAL:
-                        # We have an '*args'-like argument, let's fill it with
-                        # all positional arguments we have left and move on to
-                        # the next phase
-                        values = [arg_val]
-                        values.extend(arg_vals)
-                        arguments[param.name] = tuple(values)
-                        break
-
-                    if param.name in kwargs and param.kind != _POSITIONAL_ONLY:
-                        raise TypeError(
-                            'multiple values for argument {arg!r}'.format(
-                                arg=param.name)) from None
-
-                    arguments[param.name] = arg_val
-
-        # Now, we iterate through the remaining parameters to process
-        # keyword arguments
-        kwargs_param = None
-        for param in itertools.chain(parameters_ex, parameters):
-            if param.kind == _VAR_KEYWORD:
-                # Memorize that we have a '**kwargs'-like parameter
-                kwargs_param = param
-                continue
-
-            if param.kind == _VAR_POSITIONAL:
-                # Named arguments don't refer to '*args'-like parameters.
-                # We only arrive here if the positional arguments ended
-                # before reaching the last parameter before *args.
-                continue
-
-            param_name = param.name
-            try:
-                arg_val = kwargs.pop(param_name)
-            except KeyError:
-                # We have no value for this parameter.  It's fine though,
-                # if it has a default value, or it is an '*args'-like
-                # parameter, left alone by the processing of positional
-                # arguments.
-                if (not partial and param.kind != _VAR_POSITIONAL and
-                                                    param.default is _empty):
-                    raise TypeError('missing a required argument: {arg!r}'. \
-                                    format(arg=param_name)) from None
-
-            else:
-                if param.kind == _POSITIONAL_ONLY:
-                    # This should never happen in case of a properly built
-                    # Signature object (but let's have this check here
-                    # to ensure correct behaviour just in case)
-                    raise TypeError('{arg!r} parameter is positional only, '
-                                    'but was passed as a keyword'. \
-                                    format(arg=param.name))
-
-                arguments[param_name] = arg_val
-
-        if kwargs:
-            if kwargs_param is not None:
-                # Process our '**kwargs'-like parameter
-                arguments[kwargs_param.name] = kwargs
-            else:
-                raise TypeError(
-                    'got an unexpected keyword argument {arg!r}'.format(
-                        arg=next(iter(kwargs))))
+        # Complain about left-over arguments.
+        for _ in args:
+            raise TypeError('too many positional arguments')
+        for name in kwargs:
+            raise TypeError(f'got an unexpected keyword argument {name!r}')
 
         return self._bound_arguments_cls(self, arguments)
 
